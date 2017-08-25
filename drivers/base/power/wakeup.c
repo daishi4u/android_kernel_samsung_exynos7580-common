@@ -14,6 +14,7 @@
 #include <linux/suspend.h>
 #include <linux/seq_file.h>
 #include <linux/debugfs.h>
+#include <linux/types.h>
 #ifdef CONFIG_SEC_PM_DEBUG
 #include <linux/fb.h>
 #endif
@@ -22,8 +23,35 @@
 
 #include "power.h"
 
+static bool enable_wlan_rx_wake_ws = false;
+module_param(enable_wlan_rx_wake_ws, bool, 0644);
+
+static bool enable_wlan_ctrl_wake_ws = false;
+module_param(enable_wlan_ctrl_wake_ws, bool, 0644);
+
+static bool enable_wlan_wd_wake_ws = false;
+module_param(enable_wlan_wd_wake_ws, bool, 0644);
+
+static bool enable_wlan_wake_ws = false;
+module_param(enable_wlan_wake_ws, bool, 0644);
+
+static bool enable_netlink_ws = false;
+module_param(enable_netlink_ws, bool, 0644);
+
+static bool enable_pmsw_ws = false;
+module_param(enable_pmsw_ws, bool, 0644);
+
 static bool enable_gpsd_ws = false;
 module_param(enable_gpsd_ws, bool, 0644);
+
+static bool enable_nfc_ws = false;
+module_param(enable_nfc_ws, bool, 0644);
+
+static bool enable_pmsd_ws = false;
+module_param(enable_pmsd_ws, bool, 0644);
+
+static bool enable_pmsb_ws = false;
+module_param(enable_pmsb_ws, bool, 0644);
 
 /*
  * If set, the suspend/hibernate code will abort transitions to a sleep state
@@ -327,10 +355,16 @@ int device_init_wakeup(struct device *dev, bool enable)
 {
 	int ret = 0;
 
+	if (!dev)
+		return -EINVAL;
+
 	if (enable) {
 		device_set_wakeup_capable(dev, true);
 		ret = device_wakeup_enable(dev);
 	} else {
+		if (dev->power.can_wakeup)
+			device_wakeup_disable(dev);
+
 		device_set_wakeup_capable(dev, false);
 	}
 
@@ -504,6 +538,44 @@ static bool wakeup_source_not_registered(struct wakeup_source *ws)
 		   ws->timer.data != (unsigned long)ws;
 }
 
+static bool wakeup_source_blocker(struct wakeup_source *ws)
+{
+	unsigned int wslen = 0;
+
+	if (ws) {
+		wslen = strlen(ws->name);
+
+		if ((!enable_wlan_ctrl_wake_ws &&
+				!strncmp(ws->name, "wlan_ctrl_wake", wslen)) ||
+			(!enable_wlan_rx_wake_ws &&
+				!strncmp(ws->name, "wlan_rx_wake", wslen)) ||
+			(!enable_wlan_wd_wake_ws &&
+				!strncmp(ws->name, "wlan_wd_wake", wslen)) ||
+			(!enable_wlan_wake_ws &&
+				!strncmp(ws->name, "wlan_wake", wslen)) ||
+			(!enable_netlink_ws &&
+				!strncmp(ws->name, "NETLINK", wslen)) ||
+			(!enable_gpsd_ws &&
+                                !strncmp(ws->name, "GPSD", wslen)) ||
+			(!enable_pmsd_ws &&
+                                !strncmp(ws->name, "PowerManagerService.Display", wslen)) ||
+			(!enable_pmsb_ws &&
+                                !strncmp(ws->name, "PowerManagerService.Broadcasts", wslen)) ||
+			(!enable_pmsw_ws &&
+				!strncmp(ws->name, "PowerManagerService.WakeLocks", wslen))) {
+			if (ws->active) {
+				wakeup_source_deactivate(ws);
+				pr_info("forcefully deactivate wakeup source: %s\n",
+					ws->name);
+			}
+
+			return true;
+		}
+	}
+
+	return false;
+}
+
 /*
  * The functions below use the observation that each wakeup event starts a
  * period in which the system should not be suspended.  The moment this period
@@ -548,13 +620,6 @@ static void wakeup_source_activate(struct wakeup_source *ws)
 			"unregistered wakeup source\n"))
 		return;
 
-	if (!enable_gpsd_ws && !strncmp(ws->name, "GPSD", 6)) {
-		if (ws->active)
-			wakeup_source_deactivate(ws);
-
-		return;
-	}
-
 	/*
 	 * active wakeup source should bring the system
 	 * out of PM_SUSPEND_FREEZE state
@@ -584,13 +649,15 @@ static void wakeup_source_activate(struct wakeup_source *ws)
  */
 static void wakeup_source_report_event(struct wakeup_source *ws)
 {
-	ws->event_count++;
-	/* This is racy, but the counter is approximate anyway. */
-	if (events_check_enabled)
-		ws->wakeup_count++;
+	if (!wakeup_source_blocker(ws)) {
+		ws->event_count++;
+		/* This is racy, but the counter is approximate anyway. */
+		if (events_check_enabled)
+			ws->wakeup_count++;
 
-	if (!ws->active)
-		wakeup_source_activate(ws);
+		if (!ws->active)
+			wakeup_source_activate(ws);
+	}
 }
 
 /**
@@ -772,15 +839,30 @@ EXPORT_SYMBOL_GPL(pm_wakeup_event);
 
 void pm_get_active_wakeup_sources(char *pending_wakeup_source, size_t max)
 {
-	struct wakeup_source *ws;
+	struct wakeup_source *ws, *last_active_ws = NULL;
 	int len = 0;
+	bool active = false;
+
 	rcu_read_lock();
-	len += snprintf(pending_wakeup_source, max, "Pending Wakeup Sources: ");
 	list_for_each_entry_rcu(ws, &wakeup_sources, entry) {
 		if (ws->active) {
-			len += snprintf(pending_wakeup_source + len, max,
+			if (!active)
+				len += scnprintf(pending_wakeup_source, max,
+						"Pending Wakeup Sources: ");
+			len += scnprintf(pending_wakeup_source + len, max - len,
 				"%s ", ws->name);
+	    active = true;
+		} else if (!active &&
+			   (!last_active_ws ||
+			    ktime_to_ns(ws->last_time) >
+			    ktime_to_ns(last_active_ws->last_time))) {
+			last_active_ws = ws;
 		}
+	}
+	if (!active && last_active_ws) {
+		scnprintf(pending_wakeup_source, max,
+				"Last active Wakeup Source: %s",
+				last_active_ws->name);
 	}
 	rcu_read_unlock();
 }
@@ -796,7 +878,9 @@ static void print_active_wakeup_sources(void)
 	list_for_each_entry_rcu(ws, &wakeup_sources, entry) {
 		if (ws->active) {
 			pr_info("active wakeup source: %s\n", ws->name);
-			active = 1;
+
+			if (!wakeup_source_blocker(ws))
+				active = 1;
 		} else if (!active &&
 			   (!last_activity_ws ||
 			    ktime_to_ns(ws->last_time) >
@@ -996,7 +1080,7 @@ static int print_wakeup_source_stats(struct seq_file *m,
 	}
 
 #ifdef CONFIG_SEC_PM_DEBUG
-	ret = seq_printf(m, "%-12s\t%lu\t\t%lu\t\t%lu\t\t%lu\t\t"
+	ret = seq_printf(m, "%-32s\t%lu\t\t%lu\t\t%lu\t\t%lu\t\t"
 			"%lld\t\t%lld\t\t%lld\t\t%lld\t\t%lld\t%lld\n",
 			ws->name, active_count, ws->event_count,
 			ws->wakeup_count, ws->expire_count,
@@ -1005,7 +1089,7 @@ static int print_wakeup_source_stats(struct seq_file *m,
 			ktime_to_ms(prevent_sleep_time),
 			ktime_to_ms(time_while_screen_off));
 #else
-	ret = seq_printf(m, "%-12s\t%lu\t\t%lu\t\t%lu\t\t%lu\t\t"
+	ret = seq_printf(m, "%-32s\t%lu\t\t%lu\t\t%lu\t\t%lu\t\t"
 			"%lld\t\t%lld\t\t%lld\t\t%lld\t\t%lld\n",
 			ws->name, active_count, ws->event_count,
 			ws->wakeup_count, ws->expire_count,
@@ -1028,11 +1112,11 @@ static int wakeup_sources_stats_show(struct seq_file *m, void *unused)
 	struct wakeup_source *ws;
 
 #ifdef CONFIG_SEC_PM_DEBUG
-	seq_puts(m, "name\t\tactive_count\tevent_count\twakeup_count\t"
+	seq_puts(m, "name\t\t\t\t\tactive_count\tevent_count\twakeup_count\t"
 		"expire_count\tactive_since\ttotal_time\tmax_time\t"
 		"last_change\tprevent_suspend_time\ttime_while_screen_off\n");
 #else
-	seq_puts(m, "name\t\tactive_count\tevent_count\twakeup_count\t"
+	seq_puts(m, "name\t\t\t\t\tactive_count\tevent_count\twakeup_count\t"
 		"expire_count\tactive_since\ttotal_time\tmax_time\t"
 		"last_change\tprevent_suspend_time\n");
 #endif
